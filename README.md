@@ -103,3 +103,36 @@ In `bot.py`, the loop interval is:
 ```
 
 Change `minutes=1` to a different value if needed.
+
+## 9. Run with supervisord (CentOS)
+
+If you use `supervisord`, create a program config (example path: `/etc/supervisord.d/discord-bot.ini`):
+
+```ini
+[program:discord-bot]
+command=/usr/bin/python3 /path/to/saltysoya.moe_script/bot.py
+directory=/path/to/saltysoya.moe_script
+autostart=true
+autorestart=true
+stopsignal=TERM
+stdout_logfile=/home/brikez/discord-bot.out.log
+stderr_logfile=/home/brikez/discord-bot.err.log
+```
+
+Notes:
+- You **do not** need `environment=...` in the ini if `.env` is present in the same folder as `bot.py`.
+- The log files must be writable by the user running `supervisord`.
+
+Reload and check status:
+
+```bash
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl status
+```
+
+Follow logs:
+
+```bash
+tail -f /home/brikez/discord-bot.out.log
+```
