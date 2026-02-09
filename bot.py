@@ -152,40 +152,34 @@ async def check_channel():
         return
     log(f"Check: channel found ({channel.id}) type={type(channel).__name__}")
 
-    messages = [m async for m in channel.history(limit=1, oldest_first=False)]
+    messages = [m async for m in channel.history(limit=5, oldest_first=False)]
     if not messages:
         log("Check: no recent messages")
         return
+    log(f"Check: scanned {len(messages)} recent messages")
 
-    msg = messages[0]
-    log(
-        "Check: latest message "
-        f"id={msg.id} author={msg.author.id} created_at={msg.created_at.isoformat()} "
-        f"attachments={len(msg.attachments)}"
-    )
-
-    if msg.id <= last_id:
-        log("Check: latest message is not newer than last_message_id")
-        return
-
-    if not msg.attachments:
-        log("Check: latest message has no attachments")
-        state["last_message_id"] = str(msg.id)
-        save_state(state)
-        log(f"Check: state saved last_message_id={msg.id}")
-        return
-
+    msg = None
     att = None
-    for a in msg.attachments:
-        if is_image_attachment(a):
-            att = a
+    for m in messages:
+        log(
+            "Check: message "
+            f"id={m.id} author={m.author.id} created_at={m.created_at.isoformat()} "
+            f"attachments={len(m.attachments)}"
+        )
+        if m.id <= last_id:
+            continue
+        if not m.attachments:
+            continue
+        for a in m.attachments:
+            if is_image_attachment(a):
+                msg = m
+                att = a
+                break
+        if msg and att:
             break
 
-    if not att:
-        log("Check: latest message has no image attachments")
-        state["last_message_id"] = str(msg.id)
-        save_state(state)
-        log(f"Check: state saved last_message_id={msg.id}")
+    if not msg:
+        log("Check: no new image attachments in last 5 messages")
         return
 
     data = await att.read()
