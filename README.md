@@ -4,7 +4,7 @@ This bot connects to Discord, checks the **latest message** in a specific channe
 
 ## 1. Prerequisites
 
-- Python 3.11+ installed
+- Python 3.8+ installed (required by `discord.py` 2.x)
 - A Discord bot application and token
 - Access to the target Discord server/channel
 - An SFTP server with username/password
@@ -23,7 +23,7 @@ python -m pip install -r requirements.txt
 2. Add a **Bot** to the application.
 3. Copy the bot token.
 4. Under **Bot → Privileged Gateway Intents**, enable:
-   - **Message Content Intent** (required if you want to read text; not required for attachments)
+   - **Message Content Intent** (not required for attachments, only for text)
 5. Under **OAuth2 → URL Generator**:
    - Scope: `bot`
    - Permissions:
@@ -76,7 +76,7 @@ You should see logs like:
 
 ## 6. How It Works (Current Logic)
 
-- Every minute, the bot fetches **only the latest message** in `CHANNEL_ID`.
+- Every hour, the bot fetches **only the latest message** in `CHANNEL_ID`.
 - If that message is **newer** than the last processed message:
   - If it contains an image attachment, the image is uploaded to SFTP.
   - If not, it just updates the `state.json` with the latest message ID.
@@ -99,10 +99,10 @@ You should see logs like:
 In `bot.py`, the loop interval is:
 
 ```python
-@tasks.loop(minutes=1)
+@tasks.loop(hours=1)
 ```
 
-Change `minutes=1` to a different value if needed.
+Change `hours=1` to a different value if needed.
 
 ## 9. Run with supervisord (CentOS)
 

@@ -26,6 +26,8 @@ SFTP_KEY_PASSPHRASE = os.getenv("SFTP_KEY_PASSPHRASE")
 SFTP_REMOTE_DIR = os.getenv("SFTP_REMOTE_DIR", ".")
 
 RENAME_PATTERN = os.getenv("RENAME_PATTERN", "{timestamp}_{message_id}_{filename}")
+RETRY_DELAY_SECONDS = int(os.getenv("RETRY_DELAY_SECONDS", "600"))
+UPLOAD_TIMEOUT_SECONDS = int(os.getenv("UPLOAD_TIMEOUT_SECONDS", "20"))
 
 def log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -47,6 +49,18 @@ def save_state(state):
 def require_env(name, value):
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
+
+def get_retry_count(state, msg_id: int) -> int:
+    retry_counts = state.get("retry_counts", {})
+    return int(retry_counts.get(str(msg_id), 0))
+
+def set_retry_count(state, msg_id: int, count: int):
+    retry_counts = state.get("retry_counts", {})
+    if count <= 0:
+        retry_counts.pop(str(msg_id), None)
+    else:
+        retry_counts[str(msg_id)] = count
+    state["retry_counts"] = retry_counts
 
 def is_image_attachment(att: discord.Attachment) -> bool:
     ct = att.content_type or ""
@@ -72,6 +86,43 @@ async def upload_bytes_sftp(data: bytes, remote_name: str):
             async with sftp.open(remote_path, "wb") as f:
                 await f.write(data)
             log("SFTP: upload complete")
+
+async def try_upload_once(data: bytes, new_name: str) -> bool:
+    try:
+        await asyncio.wait_for(upload_bytes_sftp(data, new_name), timeout=UPLOAD_TIMEOUT_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        log("SFTP: timeout")
+    except Exception as e:
+        log(f"SFTP: error {e}")
+    return False
+
+async def retry_upload_after_delay(data: bytes, new_name: str, msg_id: int, filename: str):
+    log(f"Retry: scheduled in {RETRY_DELAY_SECONDS} seconds for message_id={msg_id}")
+    await asyncio.sleep(RETRY_DELAY_SECONDS)
+    ok = await try_upload_once(data, new_name)
+    if not ok:
+        state = load_state()
+        current_count = get_retry_count(state, msg_id) + 1
+        set_retry_count(state, msg_id, current_count)
+        save_state(state)
+        log(f"Retry: failed for message_id={msg_id} retry_count={current_count}")
+        if current_count < 3:
+            asyncio.create_task(retry_upload_after_delay(data, new_name, msg_id, filename))
+        else:
+            state["last_message_id"] = str(msg_id)
+            set_retry_count(state, msg_id, 0)
+            save_state(state)
+            log(f"Retry: giving up after 3 attempts, skipping message_id={msg_id}")
+        return
+    state = load_state()
+    current_last = int(state.get("last_message_id", "0"))
+    if msg_id > current_last:
+        state["last_message_id"] = str(msg_id)
+    set_retry_count(state, msg_id, 0)
+    save_state(state)
+    log(f"Retry: state saved last_message_id={msg_id}")
+    log(f"Retry: uploaded {filename} as {new_name}")
 
 
 intents = discord.Intents.default()
@@ -155,12 +206,29 @@ async def check_channel():
         new_name = f"{new_name}{ext}"
     log(f"Check: renaming to {new_name}")
 
-    await upload_bytes_sftp(data, new_name)
+    ok = await try_upload_once(data, new_name)
+    if ok:
+        state["last_message_id"] = str(msg.id)
+        set_retry_count(state, msg.id, 0)
+        save_state(state)
+        log(f"Check: state saved last_message_id={msg.id}")
+        log(f"Check: uploaded {att.filename} as {new_name}")
+        return
+
+    state = load_state()
+    current_count = get_retry_count(state, msg.id) + 1
+    set_retry_count(state, msg.id, current_count)
+    save_state(state)
+    log(f"Check: upload failed retry_count={current_count}")
+    if current_count < 3:
+        log("Check: scheduling retry")
+        asyncio.create_task(retry_upload_after_delay(data, new_name, msg.id, att.filename))
+        return
 
     state["last_message_id"] = str(msg.id)
+    set_retry_count(state, msg.id, 0)
     save_state(state)
-    log(f"Check: state saved last_message_id={msg.id}")
-    log(f"Check: uploaded {att.filename} as {new_name}")
+    log(f"Check: giving up after 3 attempts, skipping message_id={msg.id}")
 
 
 async def main():
