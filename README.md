@@ -1,13 +1,15 @@
-﻿# Discord Image Fetch Bot
+# Discord Schedule + YouTube Sync Bot
 
-This bot connects to Discord, checks the **latest message** in a specific channel on a fixed interval, and if that message has an **image attachment**, it uploads the image to an SFTP server.
+This bot connects to Discord and runs hourly checks for two channels:
+- An image channel (`CHANNEL_ID`): uploads the newest image attachment to SFTP.
+- A YouTube channel (`YOUTUBE_CHANNEL_ID`): extracts the newest YouTube link and uploads `latest-video.json` to SFTP.
 
 ## 1. Prerequisites
 
 - Python 3.8+ installed (required by `discord.py` 2.x)
 - A Discord bot application and token
-- Access to the target Discord server/channel
-- An SFTP server with username/password
+- Access to the target Discord server/channels
+- An SFTP server with username/password (or SSH key)
 
 ## 2. Install Dependencies
 
@@ -22,23 +24,30 @@ python -m pip install -r requirements.txt
 1. Go to the Discord Developer Portal and create an application.
 2. Add a **Bot** to the application.
 3. Copy the bot token.
-4. Under **Bot → Privileged Gateway Intents**, enable:
-   - **Message Content Intent** (not required for attachments, only for text)
-5. Under **OAuth2 → URL Generator**:
+4. Under **Bot -> Privileged Gateway Intents**, enable:
+   - **Message Content Intent** (needed for YouTube URL parsing from message text)
+5. Under **OAuth2 -> URL Generator**:
    - Scope: `bot`
    - Permissions:
      - `View Channels`
      - `Read Message History`
 6. Open the generated URL and invite the bot to your server.
 
-## 4. Configure `.env`
+## 4. Configure Environment
 
-Fill in `.env` with your values:
+Use `.env.example` as template and create `.env` in the same folder as `bot.py`.
 
+```bash
+cp .env.example .env
 ```
+
+Required variables in `.env`:
+
+```env
 # Discord
 DISCORD_TOKEN=YOUR_TOKEN
-CHANNEL_ID=YOUR_CHANNEL_ID
+CHANNEL_ID=YOUR_IMAGE_CHANNEL_ID
+YOUTUBE_CHANNEL_ID=YOUR_YOUTUBE_LINK_CHANNEL_ID
 
 # SFTP
 SFTP_HOST=YOUR_SFTP_HOST
@@ -47,10 +56,17 @@ SFTP_USER=YOUR_USER
 SFTP_PASSWORD=YOUR_PASSWORD
 SFTP_KEY_PATH=
 SFTP_KEY_PASSPHRASE=
-SFTP_REMOTE_DIR=/path/on/server
+SFTP_REMOTE_DIR=/var/www/virtual/brikez/html/saltysoya.moe/schedule
+SFTP_YOUTUBE_REMOTE_DIR=/var/www/virtual/brikez/html/saltysoya.moe/youtube
 
-# Rename pattern
+# Filenames / naming
 RENAME_PATTERN=schedule
+YOUTUBE_JSON_FILENAME=latest-video.json
+YOUTUBE_TITLE=Latest YouTube Video
+
+# Retry / timeout
+RETRY_DELAY_SECONDS=600
+UPLOAD_TIMEOUT_SECONDS=20
 
 # State file
 STATE_PATH=./state.json
@@ -59,7 +75,7 @@ STATE_PATH=./state.json
 Notes:
 - `RENAME_PATTERN` supports placeholders:
   - `{timestamp}`, `{message_id}`, `{filename}`, `{base}`, `{ext}`, `{author_id}`, `{channel_id}`
-- If `RENAME_PATTERN` has no extension, the bot will append the original extension automatically.
+- If `RENAME_PATTERN` has no extension, the original extension is appended.
 
 ## 5. Run the Bot
 
@@ -67,32 +83,44 @@ Notes:
 python bot.py
 ```
 
-You should see logs like:
+## 6. Current Logic
 
-```
-[2026-02-08 22:31:06Z] Logged in as YourBot#1234
-[2026-02-08 22:31:06Z] Check: starting
-```
+- Hourly image flow:
+  - Scans recent messages in `CHANNEL_ID`.
+  - Finds the first new message (newer than `last_message_id`) with an image attachment.
+  - Uploads image to `SFTP_REMOTE_DIR`.
+  - Stores progress in `state.json` under `last_message_id`.
+  - Retries failed uploads up to 3 times.
 
-## 6. How It Works (Current Logic)
-
-- Every hour, the bot fetches **only the latest message** in `CHANNEL_ID`.
-- If that message is **newer** than the last processed message:
-  - If it contains an image attachment, the image is uploaded to SFTP.
-  - If not, it just updates the `state.json` with the latest message ID.
+- Hourly YouTube flow:
+  - Scans recent messages in `YOUTUBE_CHANNEL_ID`.
+  - Finds the first new message (newer than `youtube_last_message_id`) containing a YouTube URL.
+  - Uploads JSON to `SFTP_YOUTUBE_REMOTE_DIR/YOUTUBE_JSON_FILENAME`:
+    - `{ "url": "<youtube-url>", "title": "Latest YouTube Video" }`
+  - Stores progress in `state.json` under `youtube_last_message_id`.
 
 ## 7. Common Issues
 
-### `Missing required env var: DISCORD_TOKEN`
-- The `.env` file is not being loaded or is missing the value.
+### `Missing required env var: ...`
+- `.env` is not loaded, missing, or has empty values.
+- All YouTube vars are required now:
+  - `YOUTUBE_CHANNEL_ID`
+  - `SFTP_YOUTUBE_REMOTE_DIR`
+  - `YOUTUBE_JSON_FILENAME`
+  - `YOUTUBE_TITLE`
 
-### SFTP connection hangs
-- Verify the host, port, username, and password.
-- Ensure the SSH service is reachable.
-- The bot currently uses password auth only (no key or agent).
+### Supervisor shows `FATAL Exited too quickly`
+- Usually caused by startup exception (missing env var or bad credentials).
+- Check logs:
 
-### Bot not in member list
-- You must invite it using the OAuth2 URL with **bot** scope.
+```bash
+tail -n 80 /home/brikez/log/discord-bot.err.log
+tail -n 80 /home/brikez/log/discord-bot.out.log
+```
+
+### SFTP connection hangs/fails
+- Verify host/port/user/password or key auth.
+- Ensure SSH service is reachable.
 
 ## 8. Change Interval
 
@@ -102,11 +130,11 @@ In `bot.py`, the loop interval is:
 @tasks.loop(hours=1)
 ```
 
-Change `hours=1` to a different value if needed.
+Adjust as needed.
 
 ## 9. Run with supervisord (CentOS)
 
-If you use `supervisord`, create a program config (example path: `/etc/supervisord.d/discord-bot.ini`):
+Example `/etc/supervisord.d/discord-bot.ini`:
 
 ```ini
 [program:discord-bot]
@@ -115,13 +143,9 @@ directory=/path/to/saltysoya.moe_script
 autostart=true
 autorestart=true
 stopsignal=TERM
-stdout_logfile=/home/brikez/discord-bot.out.log
-stderr_logfile=/home/brikez/discord-bot.err.log
+stdout_logfile=/home/brikez/log/discord-bot.out.log
+stderr_logfile=/home/brikez/log/discord-bot.err.log
 ```
-
-Notes:
-- You **do not** need `environment=...` in the ini if `.env` is present in the same folder as `bot.py`.
-- The log files must be writable by the user running `supervisord`.
 
 Reload and check status:
 
@@ -129,10 +153,4 @@ Reload and check status:
 sudo supervisorctl reread
 sudo supervisorctl update
 sudo supervisorctl status
-```
-
-Follow logs:
-
-```bash
-tail -f /home/brikez/discord-bot.out.log
 ```

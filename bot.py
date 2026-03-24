@@ -2,8 +2,10 @@
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import asyncssh
 import discord
@@ -16,6 +18,7 @@ STATE_PATH = Path(os.getenv("STATE_PATH", "./state.json"))
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")
 
 SFTP_HOST = os.getenv("SFTP_HOST")
 SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
@@ -24,10 +27,18 @@ SFTP_PASSWORD = os.getenv("SFTP_PASSWORD")
 SFTP_KEY_PATH = os.getenv("SFTP_KEY_PATH")
 SFTP_KEY_PASSPHRASE = os.getenv("SFTP_KEY_PASSPHRASE")
 SFTP_REMOTE_DIR = os.getenv("SFTP_REMOTE_DIR", ".")
+SFTP_YOUTUBE_REMOTE_DIR = os.getenv("SFTP_YOUTUBE_REMOTE_DIR")
+YOUTUBE_JSON_FILENAME = os.getenv("YOUTUBE_JSON_FILENAME")
+YOUTUBE_TITLE = os.getenv("YOUTUBE_TITLE")
 
 RENAME_PATTERN = os.getenv("RENAME_PATTERN", "{timestamp}_{message_id}_{filename}")
 RETRY_DELAY_SECONDS = int(os.getenv("RETRY_DELAY_SECONDS", "600"))
 UPLOAD_TIMEOUT_SECONDS = int(os.getenv("UPLOAD_TIMEOUT_SECONDS", "20"))
+
+YOUTUBE_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:youtube\.com/watch\?v=[\w-]+(?:[^\s]*)?|youtu\.be/[\w-]+(?:[^\s]*)?)",
+    re.IGNORECASE,
+)
 
 def log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -87,6 +98,26 @@ async def upload_bytes_sftp(data: bytes, remote_name: str):
                 await f.write(data)
             log("SFTP: upload complete")
 
+async def upload_bytes_sftp_to_dir(data: bytes, remote_dir: str, remote_name: str):
+    log(f"SFTP: connecting to {SFTP_HOST}:{SFTP_PORT} as {SFTP_USER}")
+    async with asyncssh.connect(
+        SFTP_HOST,
+        port=SFTP_PORT,
+        username=SFTP_USER,
+        password=SFTP_PASSWORD,
+        client_keys=None,
+        agent_path=None,
+        known_hosts=None,
+        connect_timeout=10,
+        passphrase=SFTP_KEY_PASSPHRASE,
+    ) as conn:
+        async with conn.start_sftp_client() as sftp:
+            remote_path = f"{remote_dir.rstrip('/')}/{remote_name}"
+            log(f"SFTP: uploading to {remote_path}")
+            async with sftp.open(remote_path, "wb") as f:
+                await f.write(data)
+            log("SFTP: upload complete")
+
 async def try_upload_once(data: bytes, new_name: str) -> bool:
     try:
         await asyncio.wait_for(upload_bytes_sftp(data, new_name), timeout=UPLOAD_TIMEOUT_SECONDS)
@@ -96,6 +127,25 @@ async def try_upload_once(data: bytes, new_name: str) -> bool:
     except Exception as e:
         log(f"SFTP: error {e}")
     return False
+
+async def try_upload_once_to_dir(data: bytes, remote_dir: str, new_name: str) -> bool:
+    try:
+        await asyncio.wait_for(
+            upload_bytes_sftp_to_dir(data, remote_dir, new_name),
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+        )
+        return True
+    except asyncio.TimeoutError:
+        log("SFTP: timeout")
+    except Exception as e:
+        log(f"SFTP: error {e}")
+    return False
+
+def extract_youtube_url(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = YOUTUBE_URL_RE.search(text)
+    return match.group(0) if match else None
 
 async def retry_upload_after_delay(data: bytes, new_name: str, msg_id: int, filename: str):
     log(f"Retry: scheduled in {RETRY_DELAY_SECONDS} seconds for message_id={msg_id}")
@@ -141,6 +191,10 @@ async def on_ready():
 
 @tasks.loop(hours=1)
 async def check_channel():
+    await check_image_channel()
+    await check_youtube_channel()
+
+async def check_image_channel():
     log("Check: starting")
     state = load_state()
     last_id = int(state.get("last_message_id", "0"))
@@ -224,12 +278,59 @@ async def check_channel():
     save_state(state)
     log(f"Check: giving up after 3 attempts, skipping message_id={msg.id}")
 
+async def check_youtube_channel():
+    log("YouTube: starting")
+    state = load_state()
+    last_id = int(state.get("youtube_last_message_id", "0"))
+    log(f"YouTube: youtube_last_message_id={last_id}")
+
+    channel = await client.fetch_channel(int(YOUTUBE_CHANNEL_ID))
+    if channel is None:
+        log("YouTube: channel not found. Check YOUTUBE_CHANNEL_ID and bot permissions.")
+        return
+    log(f"YouTube: channel found ({channel.id}) type={type(channel).__name__}")
+
+    messages = [m async for m in channel.history(limit=5, oldest_first=False)]
+    if not messages:
+        log("YouTube: no recent messages")
+        return
+    log(f"YouTube: scanned {len(messages)} recent messages")
+
+    msg = None
+    video_url = None
+    for m in messages:
+        if m.id <= last_id:
+            continue
+        video_url = extract_youtube_url(m.content)
+        if video_url:
+            msg = m
+            break
+
+    if not msg or not video_url:
+        log("YouTube: no new YouTube links in last 5 messages")
+        return
+
+    payload = json.dumps({"url": video_url, "title": YOUTUBE_TITLE}, indent=2).encode("utf-8")
+    ok = await try_upload_once_to_dir(payload, SFTP_YOUTUBE_REMOTE_DIR, YOUTUBE_JSON_FILENAME)
+    if not ok:
+        log("YouTube: upload failed")
+        return
+
+    state["youtube_last_message_id"] = str(msg.id)
+    save_state(state)
+    log(f"YouTube: state saved youtube_last_message_id={msg.id}")
+    log(f"YouTube: uploaded {YOUTUBE_JSON_FILENAME} with url={video_url}")
+
 
 async def main():
     require_env("DISCORD_TOKEN", DISCORD_TOKEN)
     require_env("CHANNEL_ID", CHANNEL_ID)
+    require_env("YOUTUBE_CHANNEL_ID", YOUTUBE_CHANNEL_ID)
     require_env("SFTP_HOST", SFTP_HOST)
     require_env("SFTP_USER", SFTP_USER)
+    require_env("SFTP_YOUTUBE_REMOTE_DIR", SFTP_YOUTUBE_REMOTE_DIR)
+    require_env("YOUTUBE_JSON_FILENAME", YOUTUBE_JSON_FILENAME)
+    require_env("YOUTUBE_TITLE", YOUTUBE_TITLE)
     if not (SFTP_PASSWORD or SFTP_KEY_PATH):
         raise RuntimeError("Provide SFTP_PASSWORD or SFTP_KEY_PATH")
 
